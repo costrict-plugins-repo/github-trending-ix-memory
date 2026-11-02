@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Copyright 2026 Ix Infrastructure Inc.
+
+# ix-briefing.sh — UserPromptSubmit hook
+#
+# Fires at the start of each user prompt. Injects a compact ix session briefing
+# once per 10 minutes when ix Pro is available. When model-authored annotation
+# is enabled, also injects a per-turn instruction telling Claude to end its
+# response with a terse "Ix:" line inferred from the [ix] context it saw.
+#
+# Exit 0 + JSON stdout → hookSpecificOutput.additionalContext, added to the prompt
+# Exit 0 + no stdout  → no-op
+
+# One EXIT line with this run's wall time in IX_DEBUG_LOG; nothing when unset.
+[ -z "${IX_DEBUG_LOG:-}" ] || source "${BASH_SOURCE[0]%/*}/lib/timing.sh" ix-briefing 2>/dev/null
+
+set -euo pipefail
+
+BRIEFING_TTL=600  # 10 minutes
+INPUT=$(cat)
+
+# Bail silently if ix is not in PATH
+# ── Shared library ────────────────────────────────────────────────────────────
+_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_HOOK_DIR}/lib/index.sh"
+
+# One cache per project root, in the per-user state dir. A single shared
+# /tmp/ix-briefing-cache served project A's briefing to a prompt in project B
+# for the rest of the TTL.
+_briefing_dir=$(ix_payload_project_dir "$INPUT" || true)
+_briefing_dir="${_briefing_dir:-$PWD}"
+_briefing_root=$(ix_git_root "$_briefing_dir" || printf '%s' "$_briefing_dir")
+IX_BRIEFING_CACHE="${IX_STATE_DIR}/briefing-$(hash_string "$_briefing_root")"
+_now=$(date +%s)
+_channel="${IX_ANNOTATE_CHANNEL:-modelSuffix}"
+_mode="${IX_ANNOTATE_MODE:-brief}"
+_annotation_instruction=""
+
+if [ "$_mode" != "off" ] && { [ "$_channel" = "modelSuffix" ] || [ "$_channel" = "both" ]; }; then
+  _annotation_instruction='[ix meta] Attribution: if you received any lines starting with [ix] since the last user message, you must end your response with exactly this final structure and nothing after it:\nIx\n- <short bullet about how ix was used>\n- <optional second short bullet about what ix helped with>\nRules:\n- Use the heading exactly: Ix\n- Use 1 or 2 markdown bullets only\n- Do not write a prose paragraph\n- Do not put anything after the Ix section\n- Each bullet must be short, factual, and derived only from the [ix] lines you actually saw this turn\n- Do not mention search, read, edit, or session context unless it actually happened\n- Do not add an Ix section if you received no [ix] lines this turn\nExample:\nIx\n- surfaced symbol matches before search\n- flagged edit blast radius before modification'
+fi
+
+_briefing_fresh=0
+if [ -f "$IX_BRIEFING_CACHE" ]; then
+  _cached_time=$(head -1 "$IX_BRIEFING_CACHE" 2>/dev/null || echo 0)
+  if (( (_now - _cached_time) < BRIEFING_TTL )); then
+    _briefing_fresh=1
+  fi
+fi
+
+# ── Starting points for the task: the session's first prompt ─────────────────
+# The session briefing needs Ix Pro and a project with goals, plans or
+# decisions on record; on any other project it is empty, and the first prompt
+# -- usually the task itself -- got nothing. `ix context --from-issue - --lean`
+# (Ix CLI 0.12.0+) reads that prompt as an issue and answers with the files Ix
+# trusts as starting points, or with one line saying it trusts none, which is
+# not injected. Once per session and project: the mark is claimed before ix
+# runs, so a slow or failed run still uses up the one try. The prompt goes to
+# ix on stdin and nowhere else. IX_ISSUE_START=off turns it off.
+_start_points=""
+if [ "${IX_ISSUE_START:-on}" != "off" ]; then
+  _session=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
+  _prompt=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null || echo "")
+  _start_mark="${IX_STATE_DIR}/start-$(hash_string "${_session}|${_briefing_root}")"
+  if [ -n "$_session" ] && [ ! -e "$_start_mark" ] \
+      && [ "${#_prompt}" -ge "${IX_ISSUE_START_MIN_CHARS:-40}" ]; then
+    : > "$_start_mark"
+    ix_health_check
+    IX_HOOK_NAME="ix-briefing"
+    ix_log_command ix context --from-issue - --lean --format text
+    _start_points=$(cd "$_briefing_root" && printf '%s' "$_prompt" \
+      | ix_run_bounded "${IX_ISSUE_START_TIMEOUT:-6}" ix context --from-issue - --lean --format text 2>/dev/null) \
+      || _start_points=""
+    case "$_start_points" in
+      "Ix found no confident starting point"*) ix_log "SKIP start points (Ix trusts none)"; _start_points="" ;;
+    esac
+    ix_log "START points=${#_start_points} chars"
+  fi
+fi
+
+if [ "$_briefing_fresh" -eq 1 ] && [ -z "$_annotation_instruction" ] && [ -z "$_start_points" ]; then
+  exit 0
+fi
+
+# ── Health + pro check ────────────────────────────────────────────────────────
+ix_health_check
+IX_HOOK_NAME="ix-briefing"
+_t0=""
+ix_log "ENTRY mode=${_mode:-off} channel=${_channel:-?} fresh=${_briefing_fresh}"
+BRIEFING=""
+if [ "$_briefing_fresh" -eq 0 ] && ix_check_pro; then
+  ix_log "RUN ix briefing (stale, Pro available)"
+  ix_log_command ix briefing --format text
+  _t0=$(ix_now_ms)
+  _bfr_err=$(mktemp)
+  # text, not json: nothing downstream parses this — it is injected verbatim as
+  # additionalContext — and the JSON envelope is pure cost to the model.
+  # Measured on this repo's graph: json 4,350 bytes vs text 1,283 (-70%).
+  #
+  # Not `llm`, despite what it looks like elsewhere: @ix/pro declares only
+  # text|json, and asking for a format it does not have never errors, it
+  # silently renders text. Verified byte-identical output for both.
+  _fetched_ok=1
+  BRIEFING=$(ix briefing --format text 2>"$_bfr_err") || {
+    _exit=$?
+    ix_capture_async "ix" "ix-briefing" "ix briefing failed" "$_exit" \
+      "ix briefing" "$(head -3 "$_bfr_err")"
+    rm -f "$_bfr_err"
+    BRIEFING=""
+    _fetched_ok=0
+  }
+  rm -f "$_bfr_err"
+
+  # Say nothing rather than say nothing at length. A briefing whose every
+  # section is empty is a header and a revision number — it tells the model
+  # only that Pro is installed, which costs a paragraph to convey.
+  if [ -n "$BRIEFING" ] && ! printf '%s' "$BRIEFING" \
+      | grep -qE '^(Goals|Plans|Recent Decisions|Open Bugs|Recent Changes) \([1-9]'; then
+    ix_log "SKIP briefing (no goals, plans, decisions, bugs or changes)"
+    BRIEFING=""
+  fi
+
+  # A project with a long plan list can run away with the prompt. 2 KB, not the
+  # 1 KB first proposed: a normal text briefing measures ~1.3 KB here, so a 1 KB
+  # cap would truncate the ordinary case rather than the runaway one.
+  _cap="${IX_BRIEFING_MAX_CHARS:-2048}"
+  if [ -n "$BRIEFING" ] && [ "${#BRIEFING}" -gt "$_cap" ]; then
+    ix_log "TRUNCATE briefing ${#BRIEFING} -> ${_cap} chars"
+    BRIEFING="${BRIEFING:0:$_cap}
+… briefing truncated at ${_cap} characters"
+  fi
+
+  # Hold the TTL on any successful fetch, including one deliberately suppressed
+  # above. Caching only non-empty content means a project with nothing to report
+  # re-runs `ix briefing` on every single prompt — the shape of bug P-3 fixed in
+  # the Pro probe, in a second place.
+  #
+  # Spelled out rather than `[ -n "$BRIEFING" ] && echo ...` inside the group:
+  # a trailing test that fails is the group's exit status, and under `set -e`
+  # that ends the hook.
+  if [ "$_fetched_ok" -eq 1 ]; then
+    if [ -n "$BRIEFING" ]; then
+      { echo "$_now"; echo "$BRIEFING"; } > "$IX_BRIEFING_CACHE"
+    else
+      echo "$_now" > "$IX_BRIEFING_CACHE"
+    fi
+  fi
+  ix_log "BRIEFING result=${#BRIEFING} chars"
+elif [ "$_briefing_fresh" -eq 1 ]; then
+  ix_log "SKIP briefing TTL fresh"
+else
+  ix_log "SKIP briefing (no Pro or failed)"
+fi
+
+_elapsed_ms=0
+[ -n "$_t0" ] && _elapsed_ms=$(( $(ix_now_ms) - _t0 ))
+
+_context=""
+if [ -n "$_start_points" ]; then
+  _context="[ix] Starting points for this task, from Ix's graph (a starting point, not a restriction; verify anything you rely on):"$'\n'"${_start_points}"
+  # One line saying `ix` is a command in the model's shell. With the skills
+  # hidden from the model (#53) nothing else tells it, and it never ran ix on
+  # its own. Only here, beside start points it already gets: a session with no
+  # start points pays nothing. IX_BRIEFING_TOOL_HINT=off (or 0/false) drops it.
+  case "${IX_BRIEFING_TOOL_HINT:-on}" in
+    off|0|false) ;;
+    *) _context="${_context}"$'\n'"Ix also answers in this shell: ix callers <symbol> / ix impact <symbol> (who uses it, what breaks if it changes), ix locate <name> (where it is defined). Read-only; cheaper than repeated grep for common names." ;;
+  esac
+  ix_ledger_append "UserPromptSubmit" "StartPoints" "${#_context}" "context" "1" "" "0" \
+    "pointed at the files Ix trusts as starting points for the task."
+fi
+if [ -n "$BRIEFING" ]; then
+  _briefing_block="[ix] Session briefing:\n${BRIEFING}"
+  if [ -n "$_context" ]; then
+    _context="${_context}"$'\n'"${_briefing_block}"
+  else
+    _context="${_briefing_block}"
+  fi
+  ix_ledger_append "UserPromptSubmit" "Briefing" "${#_context}" "briefing" "1" "" "$_elapsed_ms" \
+    "loaded project context up front from goals, plans, and recent decisions."
+fi
+[ -n "$_annotation_instruction" ] && {
+  if [ -n "$_context" ]; then
+    _context="${_context}\n${_annotation_instruction}"
+  else
+    _context="${_annotation_instruction}"
+  fi
+}
+
+[ -n "$_context" ] || { ix_log "DECISION silent (no content to inject)"; exit 0; }
+ix_log "DECISION injecting ${#_context} chars additionalContext"
+ix_log_injection "additionalContext" "$_context"
+
+ix_emit_context "UserPromptSubmit" "$_context"
+exit 0

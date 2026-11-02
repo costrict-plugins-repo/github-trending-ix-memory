@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Copyright 2026 Ix Infrastructure Inc.
+
+# hooks/lib/index.sh — Barrel entry point for all ix hook shared libraries
+#
+# Source this file from any hook instead of loading ix-errors.sh and ix-lib.sh
+# individually. Creates a single import hub so the ix graph can see all hooks
+# as a connected component rather than isolated single-file regions.
+#
+# Usage (from any hook in hooks/):
+#   _HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   source "${_HOOK_DIR}/lib/index.sh"
+#
+# Exports (via ix-errors.sh):
+#   IX_ERROR_MODE, IX_ERROR_STORE, ix_capture_async
+#
+# Exports (via ix-lib.sh):
+#   IX_HEALTH_CACHE, IX_PRO_CACHE
+#   ix_health_check, ix_check_pro, ix_now_ms
+#   parse_json, ix_run_text_locate, ix_summarize_text, ix_summarize_locate
+#
+# Exports (via ix-ledger.sh):
+#   IX_LEDGER_FILE
+#   ix_ledger_append, ix_ledger_last_turn
+#
+# Env defaults (set here, override via shell env):
+#   IX_ANNOTATE_MODE, IX_ANNOTATE_CHANNEL, IX_INGEST_INJECT
+#   IX_MAP_DEBOUNCE_SECONDS
+#   IX_HOOK_OUTPUT_STYLE, IX_SKIP_SECRET_PATTERNS, IX_BLOCK_ON_HIGH_CONFIDENCE
+
+_IX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_IX_LIB_DIR}/../ix-errors.sh" 2>/dev/null || true
+source "${_IX_LIB_DIR}/../ix-lib.sh"
+source "${_IX_LIB_DIR}/../ix-ledger.sh" 2>/dev/null || true
+
+# ── Plugin env defaults (override via shell env) ──────────────────────────────
+IX_ANNOTATE_MODE="${IX_ANNOTATE_MODE:-brief}"                   # off | brief | debug | verbose
+# systemMessage goes to the person; additionalContext goes into the model's
+# context window. `both` (and `modelSuffix`) add a ~0.9 KB per-prompt
+# instruction from ix-briefing.sh asking the model to write an attribution
+# section about work the person had just watched happen. The Stop summary is
+# systemMessage whatever the channel, so the person keeps seeing it.
+IX_ANNOTATE_CHANNEL="${IX_ANNOTATE_CHANNEL:-systemMessage}"    # systemMessage | modelSuffix | both
+IX_INGEST_INJECT="${IX_INGEST_INJECT:-off}"                    # off | on | debug-only
+IX_MAP_DEBOUNCE_SECONDS="${IX_MAP_DEBOUNCE_SECONDS:-300}"
+IX_HOOK_OUTPUT_STYLE="${IX_HOOK_OUTPUT_STYLE:-legacy}"         # legacy | structured (Phase C)
+IX_SKIP_SECRET_PATTERNS="${IX_SKIP_SECRET_PATTERNS:-1}"        # Phase C
+# Denying a Grep costs a whole turn -- the model has to read the denial, decide
+# what to do instead, and call again -- against a ~30k-token turn floor, to save
+# one tool call. Off by default; the hint is still injected either way. (The
+# Cursor plugin has shipped 0 from the start.)
+IX_BLOCK_ON_HIGH_CONFIDENCE="${IX_BLOCK_ON_HIGH_CONFIDENCE:-0}"  # Phase E

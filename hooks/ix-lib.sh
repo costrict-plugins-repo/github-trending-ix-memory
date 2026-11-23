@@ -1,0 +1,827 @@
+#!/usr/bin/env bash
+# Copyright 2026 Ix Infrastructure Inc.
+
+# ix-lib.sh — Shared utilities for ix Claude plugin hooks
+#
+# Source this file after sourcing ix-errors.sh:
+#   _HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   source "${_HOOK_DIR}/ix-errors.sh" 2>/dev/null || true
+#   source "${_HOOK_DIR}/ix-lib.sh"
+#
+# Exports:
+#   IX_HEALTH_CACHE         — path to the health-check TTL file
+#   IX_PRO_CACHE            — path to the pro-check cache file
+#   IX_STATE_DIR            — per-user (0700) dir holding every hook cache
+#   ix_payload_project_dir  — project dir from the hook payload (cwd)
+#   ix_git_root             — canonical git root of a dir (fails for $HOME)
+#   ix_request_auto_map     — the guarded, debounced, detached root `ix map`
+#   ix_health_check         — validate ix availability, emit one-time notice if missing
+#   ix_check_pro            — check ix pro is available; returns 0/1 after ix_health_check
+#   ix_normalize_path_for_ix — convert absolute hook paths into ix-usable relative scopes
+#   ix_log_command          — log a fully expanded ix CLI command
+#   ix_log_injection        — log exact injected hook content with escaped newlines
+#   parse_json              — strip ix header noise, extract first JSON value
+#   ix_confidence_gate      — evaluate confidence; sets CONF_GATE (drop|warn|ok) and CONF_WARN
+#   ix_locate_confident     — did ix locate pick one definition itself (exact or preferred-kind)? sets LOC_MODE, LOC_EXACT
+#   ix_emit_context         — emit hookSpecificOutput.additionalContext for an event
+#   ix_hook_decide          — emit PreToolUse block/augment/allow output (legacy or structured block)
+#   ix_hook_fallback        — degrade block/augment decisions to augment/allow when empty
+#   ix_query_intent         — classify Grep patterns as symbol-like or literal
+#   ix_run_bounded          — run a command under a wall-clock bound where possible
+#   ix_budget_start         — give the rest of this hook a shared budget for ix_run_bounded
+#   ix_looks_like_secret    — returns 0 if pattern looks like a secret/token; 1 otherwise
+#   ix_summarize_text       — summarise text results → TEXT_PART
+#   ix_trim_jsonl           — keep an append-only JSONL log under a byte cap
+
+# ── Portable millisecond timestamp ───────────────────────────────────────────
+# Usage: ix_now_ms
+# Writes a millisecond unix timestamp to stdout. Never fails: every call
+# validates the backend's output and falls through to seconds*1000 if the
+# chosen backend misbehaves, so `$(( $(ix_now_ms) - _t0 ))` is always safe
+# even under `set -euo pipefail`.
+#
+# Why this exists: `date +%s%3N` uses the GNU `%3N` extension. On macOS BSD
+# `date`, `%N` is not recognized and the literal `3N` is appended to the
+# seconds field (e.g. `17767202223N`), which breaks bash arithmetic.
+#
+# Design constraints:
+#   - Hooks call this twice per invocation (entry + exit) via command
+#     substitution, which runs in a subshell. Shell-local cache state set
+#     inside `ix_now_ms` does not propagate back to the parent process.
+#   - Exporting the backend as an env var would let subshells skip the probe,
+#     but it also lets an attacker or a stray dotfile poison the choice (e.g.
+#     `_IX_NOW_MS_BACKEND=gnu_date` on macOS reintroduces the `...3N` bug).
+#   - Probing at source time penalises hooks that exit early when `ix` is
+#     missing and never call `ix_now_ms` at all.
+#
+# Solution: cache the probe result in a file under `$TMPDIR` (same pattern
+# as `IX_HEALTH_CACHE`). Cache survives across hook invocations so the probe
+# runs at most once per user session, and reading it is cheap enough to do
+# from every subshell. Callers never read the backend from the environment.
+#
+# Backend preference (descending by speed / precision):
+#   1. `$EPOCHREALTIME`     — bash 5+ built-in, no subprocess, µs precision.
+#   2. GNU `date +%s%3N`    — Linux default; validated to reject BSD's `...N`.
+#   3. `gdate +%s%3N`       — macOS with `coreutils` installed.
+#   4. `perl -MTime::HiRes` — ships with macOS base; ms precision.
+#   5. `date +%s` × 1000    — final fallback; seconds-only precision.
+# Cache the probe result in a per-user private directory rather than a
+# world-visible name like `${TMPDIR}/ix-now-ms-backend`. A shared path is
+# subject to TOCTOU races where another local process can swap the file
+# between stat and open. Using a directory that only the current user can
+# write to removes that attack surface entirely — once the dir is owned by
+# us, no other local user can create, replace, or link files inside it.
+# If the directory cannot be created or is not owned by us (e.g. a co-tenant
+# pre-created it on a shared /tmp), `IX_NOW_MS_CACHE` is cleared and the
+# cache is disabled; `ix_now_ms` then probes on each hook invocation.
+_IX_CACHE_DIR="${TMPDIR:-/tmp}/ix-plugin-cache-${UID:-$(id -u 2>/dev/null || echo 0)}"
+# Only spawn mkdir/chmod on the cold path; the warm path is an `-d` test.
+if [ ! -d "$_IX_CACHE_DIR" ]; then
+  mkdir -p "$_IX_CACHE_DIR" 2>/dev/null && chmod 700 "$_IX_CACHE_DIR" 2>/dev/null
+fi
+if [ -d "$_IX_CACHE_DIR" ] && [ -O "$_IX_CACHE_DIR" ] && [ ! -L "$_IX_CACHE_DIR" ]; then
+  IX_NOW_MS_CACHE="${_IX_CACHE_DIR}/now-ms-backend"
+else
+  IX_NOW_MS_CACHE=""
+fi
+
+# ── Per-user state directory ─────────────────────────────────────────────────
+# Every cache the hooks keep (health, Pro flag, briefing, auto-map debounce)
+# lives here, never at a fixed name in a shared /tmp: those names were
+# predictable, shared by every user on the machine, and shared by every project
+# a user had open. The uid-scoped dir above is preferred; when it is unusable
+# (a co-tenant pre-created or symlinked it), fall back to the XDG state dir,
+# and failing that to a private dir for this one invocation (no caching).
+if [ -n "$IX_NOW_MS_CACHE" ]; then
+  IX_STATE_DIR="$_IX_CACHE_DIR"
+else
+  IX_STATE_DIR=""
+  if [ -n "${XDG_STATE_HOME:-}" ] || [ -n "${HOME:-}" ]; then
+    _ix_xdg_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/ix-claude-plugin"
+    { mkdir -p "$_ix_xdg_dir" && chmod 700 "$_ix_xdg_dir"; } 2>/dev/null || true
+    if [ -d "$_ix_xdg_dir" ] && [ -O "$_ix_xdg_dir" ] && [ ! -L "$_ix_xdg_dir" ]; then
+      IX_STATE_DIR="$_ix_xdg_dir"
+    fi
+  fi
+  [ -n "$IX_STATE_DIR" ] || IX_STATE_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t ixstateXXXXXX)
+fi
+IX_HEALTH_CACHE="${IX_STATE_DIR}/healthy"
+IX_PRO_CACHE="${IX_STATE_DIR}/pro"
+
+# ── Project root ─────────────────────────────────────────────────────────────
+# Usage: ix_payload_project_dir "$HOOK_INPUT"
+# The project the host is working in: the hook payload's `cwd`, else
+# $CLAUDE_PROJECT_DIR. Never the plugin dir and never the hook's own $PWD guess.
+ix_payload_project_dir() {
+  local _dir
+  _dir=$(printf '%s' "${1:-}" | jq -r '.cwd // empty' 2>/dev/null || true)
+  [ -n "$_dir" ] || _dir="${CLAUDE_PROJECT_DIR:-}"
+  [ -n "$_dir" ] || return 1
+  printf '%s\n' "$_dir"
+}
+
+# Usage: ix_git_root DIR
+# Prints the canonical git top-level of DIR. Returns 1 when DIR is not inside a
+# git work tree, or when the top-level is $HOME (a dotfiles repo is not a
+# project, and mapping it would walk the whole home directory).
+ix_git_root() {
+  local _dir="${1:-}" _root _home
+  { [ -n "$_dir" ] && [ -d "$_dir" ]; } || return 1
+  _root=$(git -C "$_dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$_root" ] || return 1
+  _root=$(cd -P "$_root" 2>/dev/null && pwd) || return 1
+  if [ -n "${HOME:-}" ]; then
+    _home=$(cd -P "$HOME" 2>/dev/null && pwd) || _home="$HOME"
+    [ "$_root" != "$_home" ] || return 1
+  fi
+  printf '%s\n' "$_root"
+}
+
+# ── Guarded automatic map ────────────────────────────────────────────────────
+# Usage: ix_request_auto_map PROJECT_DIR
+# The only way a hook may run `ix map`. It maps the project ROOT — `ix map`
+# rejects a file ("Map path is not a directory") — and only when all hold:
+#   1. PROJECT_DIR is in a git work tree whose root is not $HOME.
+#   2. No attempt for this root inside IX_MAP_DEBOUNCE_SECONDS (default 300).
+#      The window is per root, kept in the per-user state dir, and claimed
+#      before the backend is asked, so an unmapped project or a down backend is
+#      asked at most once per window too.
+#   3. `ix status --root <root>` says the graph is complete. An automatic map
+#      never creates a workspace; any failure, timeout or non-JSON is a skip.
+# The map itself is detached: it runs `ix map <root> --silent` from the root
+# with IX_AUTO_MAP=1 (the CLI then skips it against a remote backend) and
+# outlives the hook, so the hook's own timeout can no longer kill it midway.
+# Ix holds a per-workspace map lock, so the plugin keeps no lock of its own.
+# Always returns 0.
+ix_request_auto_map() {
+  local _dir="${1:-}" _root _stamp_dir _stamp _now _last _status
+  if ! _root=$(ix_git_root "$_dir"); then
+    ix_log "AUTOMAP skip: no git root (or root is \$HOME) for ${_dir:-<none>}"
+    return 0
+  fi
+
+  _stamp_dir="${IX_STATE_DIR}/automap"
+  [ -d "$_stamp_dir" ] || mkdir -p "$_stamp_dir" 2>/dev/null || true
+  _stamp="${_stamp_dir}/$(hash_string "$_root").last"
+  _now=$(date +%s)
+  if [ -f "$_stamp" ]; then
+    _last=$(head -c 32 "$_stamp" 2>/dev/null | tr -dc '0-9' || true)
+    if [ -n "$_last" ] && (( _now - _last < ${IX_MAP_DEBOUNCE_SECONDS:-300} )); then
+      ix_log "AUTOMAP skip: debounce ($(( _now - _last ))s ago) for $_root"
+      return 0
+    fi
+  fi
+  echo "$_now" > "$_stamp" 2>/dev/null || true
+
+  ix_log_command ix status --format json --root "$_root"
+  _status=$(cd "$_root" && ix_run_bounded "${IX_AUTO_MAP_STATUS_TIMEOUT:-10}" ix status --format json --root "$_root" 2>/dev/null) \
+    || _status=""
+  if ! printf '%s' "$(parse_json "$_status")" | jq -e '.graphCompleted == true' >/dev/null 2>&1; then
+    ix_log "AUTOMAP skip: $_root is not mapped (or ix status failed)"
+    return 0
+  fi
+
+  ix_log "AUTOMAP run: ix map $_root --silent (detached)"
+  ix_log_command ix map "$_root" --silent
+  (
+    cd "$_root" || exit 0
+    export IX_AUTO_MAP=1
+    if command -v setsid >/dev/null 2>&1; then
+      setsid ix map "$_root" --silent </dev/null >/dev/null 2>&1 &
+    else
+      nohup ix map "$_root" --silent </dev/null >/dev/null 2>&1 &
+    fi
+  ) || true
+  return 0
+}
+
+_ix_select_now_ms_backend() {
+  local _out
+  if [ -n "${EPOCHREALTIME-}" ]; then
+    printf '%s\n' "epochrealtime"; return 0
+  fi
+  if _out=$(date +%s%3N 2>/dev/null) && [[ "$_out" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "gnu_date"; return 0
+  fi
+  if command -v gdate >/dev/null 2>&1 \
+     && _out=$(gdate +%s%3N 2>/dev/null) && [[ "$_out" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "gdate"; return 0
+  fi
+  if command -v perl >/dev/null 2>&1 \
+     && _out=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000' 2>/dev/null) \
+     && [[ "$_out" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "perl"; return 0
+  fi
+  printf '%s\n' "seconds"
+}
+
+ix_now_ms() {
+  local _backend _out
+  # Only read the cache if it is a plain regular file and not a symlink. The
+  # parent directory is user-owned (see `_IX_CACHE_DIR` setup), so these
+  # checks close a vanishingly small TOCTOU window and also defend against a
+  # pre-existing file left by an earlier run that somehow became a FIFO or
+  # symlink. `head -c` caps the read so a pathological file cannot block or
+  # exhaust memory.
+  if [ -n "$IX_NOW_MS_CACHE" ] && [ -f "$IX_NOW_MS_CACHE" ] && [ ! -L "$IX_NOW_MS_CACHE" ]; then
+    _backend=$(head -c 32 "$IX_NOW_MS_CACHE" 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+  if [ -z "${_backend:-}" ]; then
+    _backend=$(_ix_select_now_ms_backend)
+    # Write via a sibling tempfile + rename so we never open the cache path
+    # itself for writing. `printf > FIFO` would block waiting for a reader,
+    # hanging every hook; `mv` atomically replaces the FIFO/symlink/regular
+    # file with our tempfile instead. Content is deterministic (one of 5
+    # known strings), so concurrent writers are idempotent.
+    if [ -n "$IX_NOW_MS_CACHE" ]; then
+      local _tmp_cache
+      _tmp_cache=$(mktemp "${IX_NOW_MS_CACHE}.XXXXXX" 2>/dev/null) && {
+        { printf '%s\n' "$_backend" > "$_tmp_cache"; } 2>/dev/null \
+          && mv -f "$_tmp_cache" "$IX_NOW_MS_CACHE" 2>/dev/null \
+          || rm -f "$_tmp_cache" 2>/dev/null
+      } || true
+    fi
+  fi
+
+  case "$_backend" in
+    epochrealtime)
+      if [ -n "${EPOCHREALTIME-}" ]; then
+        local _er="${EPOCHREALTIME/./}"
+        _out="${_er:0:13}"
+      fi
+      ;;
+    gnu_date) _out=$(date +%s%3N 2>/dev/null || true) ;;
+    gdate)    _out=$(gdate +%s%3N 2>/dev/null || true) ;;
+    perl)     _out=$(perl -MTime::HiRes=time -e 'printf "%.0f", time*1000' 2>/dev/null || true) ;;
+  esac
+
+  if [[ "${_out:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$_out"; return 0
+  fi
+
+  # Always-safe fallback: seconds × 1000. Catches a poisoned cache, a backend
+  # that stopped working after cache was written, or a bad env override.
+  _out=$(date +%s 2>/dev/null || echo 0)
+  [[ "$_out" =~ ^[0-9]+$ ]] || _out=0
+  printf '%s\n' "$(( _out * 1000 ))"
+}
+
+# ── Portable hash helper ──────────────────────────────────────────────────────
+# Usage: hash_string "some string"
+# Writes a lowercase hex digest to stdout. Tries md5sum (Linux), md5 -q (macOS),
+# shasum -a 256, then Python 3 as a final fallback.
+hash_string() {
+  local _input="$1" _out
+  if _out=$(printf '%s' "$_input" | md5sum 2>/dev/null) && [ -n "$_out" ]; then
+    printf '%s\n' "${_out%% *}"
+  elif _out=$(printf '%s' "$_input" | md5 -q 2>/dev/null) && [ -n "$_out" ]; then
+    printf '%s\n' "$_out"
+  elif _out=$(printf '%s' "$_input" | shasum -a 256 2>/dev/null) && [ -n "$_out" ]; then
+    printf '%s\n' "${_out%% *}"
+  else
+    python3 -c "import hashlib,sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest())" "$_input"
+  fi
+}
+
+# ── Bounded JSONL logs ────────────────────────────────────────────────────────
+# Usage: ix_trim_jsonl <file> [max_bytes]
+# The ledger and the error log are appended to for as long as the plugin is
+# installed. Call this after an append: once <file> is larger than max_bytes
+# (default 1 MiB; an empty, zero or non-numeric value means the default), it
+# keeps the newest whole lines that fit in half of max_bytes. The file then
+# stays under max_bytes plus one line, and the next trim is another half of
+# max_bytes of appends away. Each call costs one `wc -c`; the rewrite is rare.
+# Rewrites through a temp file and `mv`, so a reader never sees a cut line; a
+# line appended by another hook during the rewrite can be lost.
+ix_trim_jsonl() {
+  local _f="${1:-}" _max="${2:-}" _size _tmp
+  case "$_max" in ''|*[!0-9]*) _max=1048576 ;; esac
+  [ "$_max" -gt 0 ] 2>/dev/null || _max=1048576
+  [ -f "$_f" ] && [ ! -L "$_f" ] || return 0
+  _size=$(wc -c < "$_f" 2>/dev/null) || return 0
+  _size="${_size//[!0-9]/}"
+  [ "${_size:-0}" -gt "$_max" ] 2>/dev/null || return 0
+  _tmp=$(mktemp "${_f}.XXXXXX" 2>/dev/null) || return 0
+  # The byte cut lands inside a line: drop that first, partial line.
+  if tail -c "$(( _max / 2 ))" "$_f" 2>/dev/null | sed '1d' > "$_tmp" 2>/dev/null \
+     && mv -f "$_tmp" "$_f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$_tmp" 2>/dev/null
+  return 0
+}
+
+# ── Health check (no ix status — commands fail fast on their own) ─────────────
+# Keeps a 300s TTL cache so ix_check_pro can schedule re-checks without
+# calling ix status (which takes 6s+ and would reliably timeout 10s hooks).
+ix_health_check() {
+  local _now _cached _ix_notify_file
+  if ! command -v ix >/dev/null 2>&1; then
+    _ix_notify_file="${IX_STATE_DIR}/unavailable-notified"
+    if [ ! -f "$_ix_notify_file" ]; then
+      : > "$_ix_notify_file" 2>/dev/null || true
+      jq -cn '{"systemMessage": "ix not found — hooks are inactive. Install ix from https://ix.infrastructure or run: npm i -g @ix/cli"}'
+    fi
+    exit 0
+  fi
+  _now=$(date +%s)
+  if [ -f "$IX_HEALTH_CACHE" ]; then
+    _cached=$(cat "$IX_HEALTH_CACHE" 2>/dev/null || echo 0)
+    (( (_now - _cached) < 300 )) && return 0
+  fi
+  echo "$_now" > "$IX_HEALTH_CACHE"
+}
+
+# ── Bounded command runner ───────────────────────────────────────────────────
+# Usage: ix_run_bounded <seconds> <command> [args...]
+# Runs the command with a wall-clock bound where the platform can enforce one,
+# and unchanged where it cannot. `timeout` is coreutils: present on Linux and on
+# a macOS with coreutils installed, absent on a stock macOS (where it is
+# `gtimeout`, if at all). Rather than hand-roll a watchdog in a hook running
+# under `set -euo pipefail`, an unbounded run is the fallback — the callers that
+# matter also cache their result before running, so an overrun costs one hook
+# invocation rather than every one after it.
+#
+# Under a budget (ix_budget_start), the bound is also cut to what is left of
+# it, and a spent budget runs nothing: it returns 124, the exit code of a
+# command `timeout` cut short, so callers handle it as they handle a timeout.
+# Cleared on load: a budget belongs to the hook that set it, never inherited.
+_IX_DEADLINE=""
+ix_run_bounded() {
+  local _secs="$1" _left; shift
+  if [[ "${_IX_DEADLINE:-}" =~ ^[0-9]+$ ]]; then
+    _left=$(( _IX_DEADLINE - $(date +%s) ))
+    if [ "$_left" -le 0 ]; then
+      ix_log "SKIP $* (hook budget spent)"
+      return 124
+    fi
+    # A non-integer per-call bound ("2.5") cannot be compared here; the
+    # budget's remainder bounds it instead.
+    if ! [[ "$_secs" =~ ^[0-9]+$ ]] || [ "$_secs" -eq 0 ] || [ "$_secs" -gt "$_left" ]; then
+      _secs="$_left"
+    fi
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_secs" "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_secs" "$@"
+    return $?
+  fi
+  "$@"
+}
+
+# Usage: ix_budget_start <seconds>
+# Every ix_run_bounded after this, in this shell and its subshells, ends within
+# <seconds> of now: a hook that makes several ix calls in a row sets this below
+# its hooks.json timeout, so the sum of its calls cannot outlast the hook.
+# Whole seconds (`date +%s`), so a call can end up to a second past it.
+ix_budget_start() {
+  local _secs="${1:-0}"
+  [[ "$_secs" =~ ^[0-9]+$ ]] || _secs=0
+  _IX_DEADLINE=$(( $(date +%s) + _secs ))
+}
+
+# ── Pro check (TTL tied to health check) ─────────────────────────────────────
+# Returns 0 when ix briefing is available, 1 otherwise.
+# Re-checks pro only when health was just refreshed (avoids redundant ix calls).
+# Call after ix_health_check.
+ix_check_pro() {
+  local _health_ts _pro_ts _pro_val
+  _health_ts=$(cat "$IX_HEALTH_CACHE" 2>/dev/null || echo "0")
+  _pro_ts=$(cat "${IX_PRO_CACHE}.ts" 2>/dev/null || echo "")
+  if [ "$_pro_ts" != "$_health_ts" ]; then
+    # Probe with the real command, not `--help`.
+    #
+    # Pro commands are always *registered*: without @ix/pro the CLI installs a
+    # stub for each one whose action prints "The 'briefing' command requires Ix
+    # Pro." and exits 1. But commander handles --help before any action runs, so
+    # `ix briefing --help` exits 0 on a stub exactly as it does on the real
+    # command. Probing with it reported Pro as available on every OSS install,
+    # and the briefing hook then ran a Pro command that could only fail.
+    #
+    # Running the command itself is the discriminator: stub exits 1, real exits
+    # 0. This is also what skills/shared.md has always told the model to do —
+    # the shell hook was the odd one out. Called after ix_health_check, so the
+    # backend is already known reachable.
+    #
+    # The cache is claimed BEFORE the probe, and bounded while it runs. The
+    # hook that calls this has a 10s budget and the probe can take most of it;
+    # when the hook was killed mid-probe the timestamp was never written, so
+    # the next prompt probed again, and the one after that — a stall on every
+    # single prompt, for as long as the backend was slow. Writing "not Pro"
+    # up front costs at most one TTL of a missed briefing and bounds the
+    # damage to one prompt.
+    echo "0" > "$IX_PRO_CACHE"
+    echo "$_health_ts" > "${IX_PRO_CACHE}.ts"
+    # text, not json: the output is discarded, so the only thing that matters is
+    # the exit code, and text is less for the CLI to render.
+    ix_log_command ix briefing --format text
+    if ix_run_bounded "${IX_PRO_PROBE_TIMEOUT:-5}" ix briefing --format text >/dev/null 2>&1; then
+      echo "1" > "$IX_PRO_CACHE"
+    else
+      ix_log "PRO probe failed or timed out — treating as OSS until $(( ${IX_PRO_PROBE_TIMEOUT:-5} ))s after the next health refresh"
+    fi
+  fi
+  _pro_val=$(cat "$IX_PRO_CACHE" 2>/dev/null || echo "0")
+  [ "$_pro_val" = "1" ]
+}
+
+# ── Path normalizer for ix path-scoped commands ──────────────────────────────
+# Usage: ix_normalize_path_for_ix PATH [CWD]
+# Converts absolute hook paths into a relative scope that ix can resolve.
+# Strategy:
+#   - Relative paths pass through unchanged.
+#   - Absolute paths walk up from CWD (or $PWD) until the path has a matching
+#     ancestor prefix with a non-empty suffix.
+#   - Falls back to basename if no usable relative scope can be derived.
+ix_normalize_path_for_ix() {
+  local _path="${1:-}" _cwd="${2:-${PWD:-}}" _base _rel
+  [ -z "$_path" ] && return 1
+
+  if [[ "$_path" != /* ]]; then
+    printf '%s\n' "$_path"
+    return 0
+  fi
+
+  _base="${_cwd:-${PWD:-}}"
+  while [ -n "$_base" ] && [ "$_base" != "/" ] && [ "$_base" != "." ]; do
+    case "$_path" in
+      "$_base"/*)
+        _rel="${_path#"${_base}/"}"
+        if [ -n "$_rel" ]; then
+          printf '%s\n' "$_rel"
+          return 0
+        fi
+        ;;
+    esac
+    _base=$(dirname "$_base")
+  done
+
+  basename "$_path"
+}
+
+# ── Debug log helpers ────────────────────────────────────────────────────────
+# Usage: ix_log_command ix text foo --format json
+# Logs a shell-escaped command line so hook runs are easy to replay manually.
+ix_log_command() {
+  [ -z "${IX_DEBUG_LOG:-}" ] && return 0
+  local _rendered
+  printf -v _rendered '%q ' "$@"
+  _rendered="${_rendered% }"
+  ix_log "CMD ${_rendered}"
+}
+
+# Usage: ix_log_injection additionalContext "$CONTEXT"
+# Logs the exact injected content with newlines escaped as JSON string syntax.
+ix_log_injection() {
+  [ -z "${IX_DEBUG_LOG:-}" ] && return 0
+  local _label="$1" _content="${2:-}" _escaped
+  _escaped=$(printf '%s' "$_content" | jq -Rs . 2>/dev/null || printf '%s' "$_content")
+  ix_log "INJECT ${_label}=${_escaped}"
+}
+
+# ── Helper: strip ix header noise, extract first JSON array/object ────────────
+parse_json() {
+  echo "$1" | awk '/^\[|^\{/{found=1} found{print}' | jq -c . 2>/dev/null || echo ""
+}
+
+# ── Summarise ix text results ─────────────────────────────────────────────────
+# Usage: ix_summarize_text RAW_OUTPUT
+# Sets global: TEXT_PART (empty string if no results)
+ix_summarize_text() {
+  local _raw="$1" _json _count _files _more
+  TEXT_PART=""
+  _json=$(parse_json "$_raw")
+  [ -z "$_json" ] && return 0
+  _count=$(echo "$_json" | jq 'length' 2>/dev/null || echo 0)
+  if [ "${_count:-0}" -gt 0 ]; then
+    _files=$(echo "$_json" | jq -r '[.[].path] | unique | .[:4] | map(split("/")[-1]) | join(", ")' 2>/dev/null || echo "")
+    _more=$(( _count > 4 ? _count - 4 : 0 ))
+    TEXT_PART="${_count} text hits"
+    [ -n "$_files" ] && TEXT_PART="${TEXT_PART} in ${_files}"
+    [ "$_more" -gt 0 ] && TEXT_PART="${TEXT_PART} (+${_more} more)"
+  fi
+  return 0
+}
+
+# ── Confidence gate ───────────────────────────────────────────────────────────
+# Usage: ix_confidence_gate <confidence_value>
+# Sets globals: CONF_GATE ("drop" | "warn" | "ok") and CONF_WARN (string, empty if ok/drop)
+# Callers check CONF_GATE:
+#   "drop" → discard structural data or skip injection entirely
+#   "warn" → include CONF_WARN in context output
+#   "ok"   → proceed normally
+ix_confidence_gate() {
+  local _c="$1"
+  CONF_GATE="ok"
+  CONF_WARN=""
+  if awk "BEGIN {c=${_c}+0; exit !(c < 0.3)}"; then
+    CONF_GATE="drop"
+  elif awk "BEGIN {c=${_c}+0; exit !(c < 0.6)}"; then
+    CONF_GATE="warn"
+    CONF_WARN="⚠ Graph confidence low (${_c}) — treat structural data as approximate"
+  fi
+}
+
+# ── Did ix locate resolve one definition? ────────────────────────────────────
+# Usage: ix_locate_confident LOCATE_JSON [QUERY]
+# Returns 0 when `ix locate --format json` resolved one definition the hooks can
+# stand behind: a resolvedTarget with a name and a path, no error `code`, and a
+# resolutionMode that names a definition the CLI picked itself. Sets globals:
+#   LOC_MODE   the resolutionMode printed ("" when there is none)
+#   LOC_EXACT  1 when the target is an exact name match the hooks checked
+#              themselves (see below), else 0; the opt-in deny keys on this
+#
+# `ix locate` prints no confidence score, so the hooks used to read a
+# `confidence` that was never there, default it to 1 and pass every resolution.
+# resolutionMode is the signal the CLI does print. The values below are those
+# the test fixtures record for Ix CLI 0.12.1 (exact, preferred-kind, scored,
+# ambiguous, heuristic, none; later releases add fuzzy). No test runs a
+# resolving `ix locate` against a real CLI (tests/test_real_ix.sh has no
+# backend), so neither the list nor where the key sits is verified there. The
+# fixtures print it at the top level; `ix callers` prints it inside
+# resolvedTarget, so locate may too, and the top level is read first, then
+# resolvedTarget. They are read as:
+#   exact           an exact name match
+#   preferred-kind  one target, an exact-name tie broken by kind or a near-exact score
+#   (no key)        the fixtures omit the mode on an exact match. Not taken on
+#                   trust: it passes only when the target's name is QUERY (or
+#                   QUERY's last `.`/`::`/`#`/`/` segment), so a CLI that never
+#                   prints a mode cannot pass a fuzzy pick as exact
+#   anything else   a looser score, a heuristic or fuzzy pick, an ambiguous
+#                   name, a miss, or a mode added later
+# Only the first three count, so the hooks stay silent rather than inject on a
+# guess. LOC_EXACT, for the IX_BLOCK_ON_HIGH_CONFIDENCE=1 deny in
+# ix-intercept.sh, is narrower: a mode of exact or none, AND the name check
+# above, whatever the mode says. An ambiguous name never passes: it carries
+# resolutionMode "ambiguous" (and, in later releases, an error `code`). If the
+# CLI labels an ordinary match some other way, the hooks go quiet (fail safe:
+# no false deny, the native search still runs) and the turned-down mode is
+# written to IX_DEBUG_LOG.
+ix_locate_confident() {
+  local _ok _res _rest
+  # One jq pass for the verdict, the name check and the mode: the Grep hook
+  # waits on this.
+  _res=$(printf '%s' "$1" | jq -r --arg q "${2:-}" '
+    (.resolutionMode // (if (.resolvedTarget | type) == "object" then .resolvedTarget.resolutionMode else null end)) as $mode
+    | (($mode // "") | tostring | gsub("[\u001f\n]"; " ")) as $printed
+    | ((.resolvedTarget.name // "") | tostring) as $n
+    | ($q != "" and $n != "" and ($n == $q or $n == ($q | sub("^.*(\\.|::|#|/)"; ""))))  as $named
+    | (if (.code // null) != null then "no"
+       elif ($n == "") or ((.resolvedTarget.path // "") == "") then "no"
+       elif $mode == null then (if $named then "yes" else "unnamed" end)
+       elif ($mode == "exact" or $mode == "preferred-kind") then "yes"
+       else "mode" end)
+    + "\u001f" + (if $named and ($mode == null or $mode == "exact") then "1" else "0" end)
+    + "\u001f" + $printed' 2>/dev/null) || _res=""
+  _ok="${_res%%$'\x1f'*}"
+  LOC_MODE=""
+  LOC_EXACT=0
+  if [ "$_res" != "$_ok" ]; then
+    _rest="${_res#*$'\x1f'}"
+    LOC_EXACT="${_rest%%$'\x1f'*}"
+    [ "$_rest" != "$LOC_EXACT" ] && LOC_MODE="${_rest#*$'\x1f'}"
+    [ "$LOC_EXACT" = "1" ] || LOC_EXACT=0
+  fi
+  [ -n "$_ok" ] || _ok="no"
+  # A named target turned down only for its mode, or for an unlabelled match
+  # whose name is not the one searched for, is logged, so a release that labels
+  # an ordinary exact match differently shows up in IX_DEBUG_LOG instead of
+  # silencing the hints unnoticed.
+  [ "$_ok" = "mode" ] && ix_log "LOCATE target not used: resolutionMode=${LOC_MODE}"
+  [ "$_ok" = "unnamed" ] && ix_log "LOCATE target not used: no resolutionMode and name is not '${2:-}'"
+  [ "$_ok" = "yes" ]
+}
+
+# ── Hook output: model context ───────────────────────────────────────────────
+# Usage: ix_emit_context <hookEventName> <text>
+# Claude Code reads hook-supplied model context only from
+# hookSpecificOutput.additionalContext, and only when hookSpecificOutput's
+# hookEventName names the event that fired the hook (it rejects a mismatch). A
+# top-level `additionalContext` is dropped with "Hook JSON output had
+# unrecognized keys (ignored): additionalContext" (Claude Code 2.1.287 hook
+# output schema; https://code.claude.com/docs/en/hooks#add-context-for-claude).
+# No permissionDecision: this only adds context. A PreToolUse "allow" would also
+# skip the user's permission prompt for the tool call it rides on.
+ix_emit_context() {
+  jq -cn --arg e "$1" --arg c "$2" \
+    '{"hookSpecificOutput": {"hookEventName": $e, "additionalContext": $c}}'
+}
+
+# ── Hook output decision helper (PreToolUse) ─────────────────────────────────
+# Usage: ix_hook_decide <mode> <content>
+#   mode    — "block" | "augment" | "allow"
+#   content — reason string (block) or context string (augment); ignored for allow
+# Emits the Claude Code PreToolUse JSON and exits.
+#   block   — the tool call is denied and `content` is what the model receives
+#             in place of the tool result. Structured: permissionDecision
+#             "deny" + permissionDecisionReason (the enum is allow|deny|ask|
+#             defer; "block" fails validation). Legacy: top-level
+#             decision "block" + reason, which Claude Code still honours for
+#             PreToolUse as a deny with that reason.
+#   augment — the tool runs; `content` reaches the model next to its result.
+#   allow   — no output; the tool runs under the user's normal permissions.
+ix_hook_decide() {
+  local _mode="$1"
+  local _content="${2:-}"
+  case "$_mode" in
+    block)
+      if [ "${IX_HOOK_OUTPUT_STYLE:-legacy}" = "structured" ]; then
+        jq -cn --arg r "$_content" '{
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": $r
+          }
+        }'
+      else
+        jq -cn --arg r "$_content" '{"decision": "block", "reason": $r}'
+      fi
+      ;;
+    augment)
+      ix_emit_context "PreToolUse" "$_content"
+      ;;
+    allow|*)
+      exit 0
+      ;;
+  esac
+  exit 0
+}
+
+# ── Hook output fallback helper ──────────────────────────────────────────────
+# Usage: ix_hook_fallback <intended_mode> <content> [<augment_fallback_content>]
+# Fallback chain: block → augment → allow, augment → allow.
+ix_hook_fallback() {
+  local _intended="$1"
+  local _content="${2:-}"
+  local _augment_fallback="${3:-}"
+
+  case "$_intended" in
+    block)
+      if [ -n "$_content" ]; then
+        ix_hook_decide "block" "$_content"
+      elif [ -n "$_augment_fallback" ]; then
+        ix_hook_decide "augment" "$_augment_fallback"
+      else
+        ix_hook_decide "allow" ""
+      fi
+      ;;
+    augment)
+      if [ -n "$_content" ]; then
+        ix_hook_decide "augment" "$_content"
+      else
+        ix_hook_decide "allow" ""
+      fi
+      ;;
+    *)
+      ix_hook_decide "allow" ""
+      ;;
+  esac
+}
+
+# ── Grep query-intent classifier ─────────────────────────────────────────────
+# Usage: ix_query_intent <pattern>
+# Sets global: QUERY_INTENT ("symbol" | "literal")
+# "symbol" → pattern looks like a code symbol/system query → pursue ix lookup
+# "literal" → pattern looks like a string/log/doc search → allow native tool
+ix_query_intent() {
+  local _p="$1"
+  QUERY_INTENT="symbol"
+
+  # Pure regex indicators → literal. `|` is in there because an alternation
+  # (`pytest|yaml|rich`) is a grep expression, not a symbol: the graph has no
+  # entity by that name, so every one of them cost an ix round trip to learn
+  # nothing.
+  if printf '%s\n' "$_p" | grep -qE '[*+?|]|[][()]|\\\w|\{[0-9]|\^[^^]|\$$'; then
+    QUERY_INTENT="literal"; return
+  fi
+
+  # Common string/log/doc search patterns → literal
+  if printf '%s\n' "$_p" | grep -qiE '^(TODO|FIXME|HACK|NOTE|XXX|DEPRECATED|error:|warn:|info:|debug:|fatal:)'; then
+    QUERY_INTENT="literal"; return
+  fi
+
+  # Multi-word patterns are usually prose/log searches, not symbol lookups.
+  if printf '%s\n' "$_p" | grep -q '[[:space:]]'; then
+    QUERY_INTENT="literal"; return
+  fi
+
+  # Very long patterns (>60 chars) are likely log lines or prose → literal
+  [ "${#_p}" -gt 60 ] && { QUERY_INTENT="literal"; return; }
+
+  # Quoted strings (starts and ends with quote) → literal
+  if printf '%s\n' "$_p" | grep -qE "^['\"].*['\"]$"; then
+    QUERY_INTENT="literal"; return
+  fi
+
+  # Otherwise treat as potential symbol — let confidence gating decide
+}
+
+# ── Secret / high-entropy pattern detector ───────────────────────────────────
+# Usage: ix_looks_like_secret <pattern>
+# Returns 0 (true) if the pattern looks like a secret or API token; 1 otherwise.
+# Used to silently skip injection/logging when a search pattern is a credential.
+ix_looks_like_secret() {
+  local _p="$1"
+  # Known secret prefixes (OpenAI, GitHub, GitLab, Bearer tokens, JWTs)
+  printf '%s\n' "$_p" | grep -qE '^(sk-|ghp_|ghs_|glpat-|Bearer |eyJ)' && return 0
+  # Long high-entropy token (>= 32 chars, mostly base64/hex alphabet)
+  local _len="${#_p}"
+  if [ "$_len" -ge 32 ]; then
+    # Preserve coverage for opaque lowercase-alpha keys without re-flagging
+    # snake_case or alternation-heavy code search patterns.
+    printf '%s' "$_p" | grep -qE '^[a-z]{32,}$' && return 0
+    local _has_signal=0
+    printf '%s' "$_p" | grep -q '[0-9]' && _has_signal=1
+    if printf '%s' "$_p" | grep -q '[A-Z]' && printf '%s' "$_p" | grep -q '[a-z]'; then
+      _has_signal=1
+    fi
+    printf '%s' "$_p" | grep -q '[+/=]' && _has_signal=1
+    [ "$_has_signal" -eq 0 ] && return 1
+    local _alnum
+    _alnum=$(printf '%s' "$_p" | tr -cd 'A-Za-z0-9+/=_-' | wc -c | tr -d ' ')
+    awk "BEGIN { exit !($_alnum / $_len > 0.90) }" && return 0
+  fi
+  return 1
+}
+
+# ── Debug log helper ─────────────────────────────────────────────────────────
+# Set IX_DEBUG_LOG=/tmp/ix-hooks.log (or any path) to enable.
+# Each hook sets IX_HOOK_NAME before calling this.
+ix_log() {
+  [ -z "${IX_DEBUG_LOG:-}" ] && return 0
+  local _ts
+  _ts=$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo "?")
+  printf '[%s] [%s] %s\n' "$_ts" "${IX_HOOK_NAME:-hook}" "$*" >> "${IX_DEBUG_LOG}" 2>/dev/null || true
+}
+
+# ── What grep cannot say about a name ────────────────────────────────────────
+# Usage: ix_definition_context LOCATE_RAW [LOCATE_JSON] [QUERY]
+# QUERY is the name searched for; ix_locate_confident checks an unlabelled
+# resolution against it.
+# Sets global: DEF_PART — empty unless locate resolved one definition by an
+# exact or preferred-kind match (ix_locate_confident). Then: where it is defined,
+# and who calls it, at the call site, nearest the definition's file first:
+#   [ix] `beta` (function) is defined at src/lib.js:5-7; called from 2 places:
+#   src/app.js:4 `return beta(1);` · src/report.js:5 `return …`
+#
+# A grep the model is about to run already lists every line that mentions the
+# name, so repeating those hits back (what the Bash and Grep hooks used to do)
+# told it nothing, and "prefer ix text over grep" was not followed: agents
+# shown the hint did not run ix, and did not call Ix's tools on their own when
+# they were on offer as MCP. Which line is the definition, and which mentions are
+# calls, is the part only the graph knows. `ix callers` runs bounded (IX_CALLERS_TIMEOUT, default 4s); a failure
+# or timeout leaves the definition on its own.
+ix_definition_context() {
+  local _raw="$1" _json _fields _name _kind _path _start _end _where _cal_raw _cal_json _total _sites _more _dir
+  DEF_PART=""
+  # A caller that has already parsed the output and passed it through
+  # ix_locate_confident (ix-intercept.sh) hands that JSON over as $2, so the
+  # gate's jq work and its debug-log line are not repeated.
+  if [ -n "${2:-}" ]; then
+    _json="$2"
+  else
+    _json=$(parse_json "$_raw")
+    [ -z "$_json" ] && return 0
+    ix_locate_confident "$_json" "${3:-}" || return 0
+  fi
+  _fields=$(printf '%s' "$_json" | jq -r '
+    [ (.resolvedTarget.name // ""), (.resolvedTarget.path // ""),
+      (.resolvedTarget.kind // "symbol"), (.lineRange.start // ""), (.lineRange.end // "") ]
+    | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' 2>/dev/null) || _fields=""
+  [ -z "$_fields" ] && return 0
+  IFS=$'\x1f' read -r _name _path _kind _start _end <<< "$_fields" || true
+  [ -z "$_name" ] || [ -z "$_path" ] && return 0
+  _where="$_path"
+  if [ -n "$_start" ]; then
+    _where="${_where}:${_start}"
+    [ -n "$_end" ] && [ "$_end" != "$_start" ] && _where="${_where}-${_end}"
+  fi
+  DEF_PART="[ix] \`${_name}\` (${_kind}) is defined at ${_where}"
+
+  ix_log_command ix callers "$_name" --format json
+  _cal_raw=$(ix_run_bounded "${IX_CALLERS_TIMEOUT:-4}" ix callers "$_name" --format json 2>/dev/null) || true
+  _cal_json=$(parse_json "$_cal_raw")
+  [ -z "$_cal_json" ] && return 0
+  _total=$(echo "$_cal_json" | jq -r '(.summary.total // (.results | length) // 0)' 2>/dev/null || echo 0)
+  if [ "${_total:-0}" -eq 0 ]; then
+    DEF_PART="${DEF_PART}; the graph has no callers for it"
+    return 0
+  fi
+  # Nearest first: callers in the definition's own directory lead.
+  _dir=$(dirname "$_path")
+  _sites=$(echo "$_cal_json" | jq -r --arg dir "$_dir/" '
+    [.results[]? | {p: (.site.path // .path // ""), l: (.site.line // .lineStart // ""),
+                    s: ((.site.snippet // .name // "") | gsub("\\s+"; " ") | .[0:60])}]
+    | sort_by(if (.p | startswith($dir)) then 0 else 1 end)
+    | .[:3] | map(.p + ":" + (.l | tostring) + " `" + .s + "`") | join(" · ")' 2>/dev/null || echo "")
+  _more=$(( _total > 3 ? _total - 3 : 0 ))
+  if [ -n "$_sites" ]; then
+    DEF_PART="${DEF_PART}; called from ${_total} place$([ "$_total" -eq 1 ] || echo s): ${_sites}"
+    [ "$_more" -gt 0 ] && DEF_PART="${DEF_PART} (+${_more} more)"
+  fi
+  return 0
+}
+
